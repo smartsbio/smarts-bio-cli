@@ -16,7 +16,7 @@ pub struct Workspace {
     pub created_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ToolInfo {
     #[serde(default)]
     pub id: Option<String>,
@@ -31,7 +31,7 @@ pub struct ToolInfo {
     pub parameters: Option<Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FileItem {
     #[serde(default)]
     pub key: Option<String>,

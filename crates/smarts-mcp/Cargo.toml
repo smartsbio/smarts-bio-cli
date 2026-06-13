@@ -1,0 +1,17 @@
+[package]
+name = "smarts-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "MCP server exposing smarts.bio over the Model Context Protocol"
+
+[dependencies]
+smarts-client = { path = "../smarts-client" }
+rmcp = { version = "0.9", features = ["server", "transport-io", "macros"] }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+schemars = "1"

@@ -17,6 +17,11 @@ use crate::models::{FileItem, ToolInfo, Workspace};
 pub const DIRECT_UPLOAD_LIMIT: u64 = 10 * 1024 * 1024;
 
 impl SmartsClient {
+    /// Authenticated user's profile (`GET /v1/user/profile`, JWT login only).
+    pub async fn user_profile(&self) -> Result<Value> {
+        self.get("/v1/user/profile", &[]).await
+    }
+
     // ---- Workspaces -------------------------------------------------------
 
     pub async fn list_workspaces(&self) -> Result<Vec<Workspace>> {

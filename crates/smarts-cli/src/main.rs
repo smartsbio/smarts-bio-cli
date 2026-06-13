@@ -7,17 +7,18 @@
 
 mod chat;
 mod localopen;
+mod mcp_install;
 mod output;
 
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::{json, Value};
-use smarts_client::{resolve_path, Config, SmartsClient};
+use smarts_client::{resolve_path, Config, DevicePoll, SmartsClient, TokenSource};
 
 use output::{extract_array, first_str, human_size, print_json, table, truncate};
 
@@ -47,7 +48,7 @@ struct Cli {
 enum Command {
     /// Start an interactive chat with the agent.
     Chat(ChatArgs),
-    /// Log in via the browser (planned — phase 2).
+    /// Log in via the browser (device-code flow; works over SSH/headless).
     Login,
     /// Clear stored credentials.
     Logout,
@@ -101,7 +102,7 @@ enum Command {
         #[command(subcommand)]
         cmd: ConversationCmd,
     },
-    /// Run the MCP server (planned — phase 3).
+    /// Run the MCP server (for Claude Desktop, Cursor, and other MCP clients).
     Mcp {
         #[command(subcommand)]
         cmd: McpCmd,
@@ -244,8 +245,25 @@ enum ConversationCmd {
 
 #[derive(Subcommand)]
 enum McpCmd {
-    /// Start the MCP server.
+    /// Start the MCP server (stdio).
     Serve,
+    /// Register the smarts MCP server into local clients (Claude Desktop, Cursor, …).
+    Install(McpInstallArgs),
+    /// Remove the smarts MCP server from local clients.
+    Uninstall(McpInstallArgs),
+}
+
+#[derive(Args)]
+struct McpInstallArgs {
+    /// Clients to target: claude-desktop, claude-code, cursor, windsurf, gemini-cli, vscode.
+    /// Default: every detected client.
+    clients: Vec<String>,
+    /// Target all supported clients, not just detected ones.
+    #[arg(long)]
+    all: bool,
+    /// Print the config snippet instead of writing it (install only).
+    #[arg(long)]
+    print: bool,
 }
 
 /// Shared handler state.
@@ -310,7 +328,7 @@ async fn run() -> Result<()> {
 
     match command {
         Command::Chat(args) => chat::run(&ctx, args.conversation).await,
-        Command::Login => cmd_login(),
+        Command::Login => cmd_login(&mut ctx).await,
         Command::Logout => cmd_logout(),
         Command::Auth { cmd } => cmd_auth(&ctx, cmd).await,
         Command::Workspace { cmd } => cmd_workspace(&mut ctx, cmd).await,
@@ -321,25 +339,85 @@ async fn run() -> Result<()> {
         Command::File { cmd } => cmd_file(&mut ctx, cmd).await,
         Command::Open { path, print_url } => localopen::open(&path, print_url),
         Command::Conversation { cmd } => cmd_conversation(&ctx, cmd).await,
-        Command::Mcp { cmd } => cmd_mcp(cmd),
+        Command::Mcp { cmd } => cmd_mcp(&ctx, cmd).await,
     }
 }
 
 // ---- Auth -----------------------------------------------------------------
 
-fn cmd_login() -> Result<()> {
-    println!(
-        "Browser login is planned for phase 2.\n\
-         For now, authenticate with an API key:\n  \
-         smarts auth set-key sk_live_...\n  \
-         (or set the SMARTSBIO_API_KEY environment variable)"
-    );
+async fn cmd_login(ctx: &mut Ctx) -> Result<()> {
+    let info = ctx.client.start_device_login().await?;
+
+    println!("\nTo sign in, open:\n  \x1b[4m{}\x1b[0m", info.verification_uri);
+    println!("and enter the code:\n\n      \x1b[1;36m{}\x1b[0m\n", info.user_code);
+
+    let open_url = info
+        .verification_uri_complete
+        .as_deref()
+        .unwrap_or(&info.verification_uri);
+    if webbrowser::open(open_url).is_ok() {
+        println!("(opening your browser…)");
+    }
+
+    let spinner = ProgressBar::new_spinner();
+    spinner.enable_steady_tick(Duration::from_millis(120));
+    spinner.set_message("waiting for you to approve in the browser… (Ctrl-C to cancel)");
+
+    let mut interval = info.interval.max(1);
+    let deadline = Instant::now() + Duration::from_secs(info.expires_in);
+    loop {
+        if Instant::now() >= deadline {
+            spinner.finish_and_clear();
+            bail!("login timed out — run `smarts login` again");
+        }
+        tokio::time::sleep(Duration::from_secs(interval)).await;
+        match ctx.client.poll_device_token(&info.device_code).await {
+            Ok(DevicePoll::Approved) => {
+                spinner.finish_and_clear();
+                break;
+            }
+            Ok(DevicePoll::Pending) => {}
+            Ok(DevicePoll::SlowDown) => interval += 5,
+            Ok(DevicePoll::Denied) => {
+                spinner.finish_and_clear();
+                bail!("login was denied in the browser");
+            }
+            Ok(DevicePoll::Expired) => {
+                spinner.finish_and_clear();
+                bail!("login request expired — run `smarts login` again");
+            }
+            // Tolerate transient network errors while polling.
+            Err(_) => {}
+        }
+    }
+
+    // Greet the user and adopt their default workspace if we don't have one.
+    match ctx.client.user_profile().await {
+        Ok(profile) => {
+            let who = first_str(&profile, &["email", "name"])
+                .or_else(|| profile.pointer("/data/email").and_then(Value::as_str).map(str::to_string));
+            match who {
+                Some(w) => println!("✓ Logged in as {w}"),
+                None => println!("✓ Logged in"),
+            }
+            if ctx.config.default_workspace.is_none() {
+                if let Some(ws) = first_str(&profile, &["defaultWorkspaceId"])
+                    .or_else(|| profile.pointer("/data/defaultWorkspaceId").and_then(Value::as_str).map(str::to_string))
+                {
+                    ctx.config.default_workspace = Some(ws.clone());
+                    let _ = ctx.config.save();
+                    println!("  default workspace set to {ws}");
+                }
+            }
+        }
+        Err(_) => println!("✓ Logged in"),
+    }
     Ok(())
 }
 
 fn cmd_logout() -> Result<()> {
-    smarts_client::credentials::clear_api_key()?;
-    println!("Cleared stored credentials.");
+    smarts_client::credentials::clear_all()?;
+    println!("Logged out — cleared stored credentials.");
     Ok(())
 }
 
@@ -355,19 +433,29 @@ async fn cmd_auth(ctx: &Ctx, cmd: AuthCmd) -> Result<()> {
         }
         AuthCmd::Status => {
             println!("Gateway:  {}", ctx.client.base_url());
-            if !ctx.client.has_credentials() {
-                println!("Status:   not authenticated");
-                println!(
-                    "          run `smarts auth set-key sk_live_...` or set SMARTSBIO_API_KEY"
-                );
-                return Ok(());
-            }
-            let source = if smarts_client::credentials::api_key_is_from_env() {
-                "environment (SMARTSBIO_API_KEY)"
-            } else {
-                "OS keychain"
+            let source = ctx.client.token_source();
+            let label = match source {
+                TokenSource::None => {
+                    println!("Status:   not authenticated");
+                    println!(
+                        "          run `smarts login`, or set SMARTSBIO_API_KEY / `smarts auth set-key`"
+                    );
+                    return Ok(());
+                }
+                TokenSource::Login => "browser login (`smarts login`)",
+                TokenSource::EnvApiKey => "API key (SMARTSBIO_API_KEY env)",
+                TokenSource::KeychainApiKey => "API key (keychain)",
             };
-            println!("Status:   authenticated (key from {source})");
+            println!("Status:   authenticated — {label}");
+            if source == TokenSource::Login {
+                if let Ok(profile) = ctx.client.user_profile().await {
+                    if let Some(email) = first_str(&profile, &["email"])
+                        .or_else(|| profile.pointer("/data/email").and_then(Value::as_str).map(str::to_string))
+                    {
+                        println!("User:     {email}");
+                    }
+                }
+            }
             match ctx.client.list_workspaces().await {
                 Ok(ws) => {
                     println!("Access:   {} workspace(s)", ws.len());
@@ -901,11 +989,22 @@ async fn cmd_conversation(ctx: &Ctx, cmd: ConversationCmd) -> Result<()> {
 
 // ---- Stubs for later phases ----------------------------------------------
 
-fn cmd_mcp(cmd: McpCmd) -> Result<()> {
+async fn cmd_mcp(ctx: &Ctx, cmd: McpCmd) -> Result<()> {
     match cmd {
+        McpCmd::Install(args) => mcp_install::run_install(args.clients, args.all, args.print),
+        McpCmd::Uninstall(args) => mcp_install::run_uninstall(args.clients, args.all),
         McpCmd::Serve => {
-            println!("The MCP server is planned for phase 3 (local stdio first, then hosted).");
-            Ok(())
+            // stdout is the MCP protocol channel — must not print anything to it.
+            if !ctx.client.has_credentials() {
+                eprintln!(
+                    "warning: not authenticated — run `smarts login` (or set SMARTSBIO_API_KEY) \
+                     so the MCP tools can reach your account."
+                );
+            }
+            eprintln!("smarts MCP server ready on stdio.");
+            smarts_mcp::serve_stdio(ctx.client.clone(), ctx.config.default_workspace.clone())
+                .await
+                .map_err(|e| anyhow!(e))
         }
     }
 }

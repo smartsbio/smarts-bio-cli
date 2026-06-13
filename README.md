@@ -131,6 +131,55 @@ automatically (the agent `sessionId` is captured and reused), and **Ctrl-C
 interrupts** an in-flight answer (Ctrl-D or `/exit` leaves). In-chat commands:
 `/new` (fresh conversation), `/workspace`, `/ls`, `/help`, `/exit`.
 
+### MCP server (Claude Desktop, Cursor, …)
+
+`smarts mcp serve` runs a Model Context Protocol server over stdio, exposing the
+agent + tools + pipelines + workspace files as MCP tools (`smarts_query`,
+`smarts_run_tool`, `smarts_run_pipeline`, `smarts_list_files`, …). It reuses your
+CLI credentials, so run `smarts login` (or set `SMARTSBIO_API_KEY`) first.
+
+Register it automatically into your installed clients:
+
+```bash
+smarts mcp install              # auto-detect & configure all detected clients
+smarts mcp install cursor       # a specific client
+smarts mcp install --all        # every supported client
+smarts mcp install --print      # just print the snippet to paste
+smarts mcp uninstall            # remove it again
+```
+
+Supported (local stdio): **Claude Desktop, Claude Code, Cursor, Windsurf, Gemini CLI, VS Code**.
+`install` writes the **absolute** binary path (so GUI apps with a minimal PATH still find it)
+and bakes in `SMARTSBIO_BASE_URL` if it's set, merging without clobbering your other servers
+(and backing up the file first). Restart the client afterward.
+
+**ChatGPT, Gemini (app), Claude (web)** can't be installed locally — they only accept a *remote*
+MCP URL added in their settings. Those need the hosted `mcp.smarts.bio` server.
+
+Or configure any client by hand:
+
+```json
+{
+  "mcpServers": {
+    "smarts": { "command": "smarts", "args": ["mcp", "serve"] }
+  }
+}
+```
+
+For a local stack, add the gateway URL:
+
+```json
+{
+  "mcpServers": {
+    "smarts": {
+      "command": "smarts",
+      "args": ["mcp", "serve"],
+      "env": { "SMARTSBIO_BASE_URL": "http://localhost:3022" }
+    }
+  }
+}
+```
+
 ## Configuration
 
 - Secrets (the `sk_live_` key) live in the OS keychain via the `keyring` crate.
@@ -142,10 +191,13 @@ interrupts** an in-flight answer (Ctrl-D or `/exit` leaves). In-chat commands:
 
 ## Roadmap
 
-- **Phase 2** — `smarts login` (browser OAuth2 PKCE via loopback). *(Local-file
-  `smarts open` is already implemented — loopback serve, no upload.)*
-- **Phase 3** — `smarts mcp serve` (local stdio) and a hosted Streamable-HTTP
-  deployment at `mcp.smarts.bio` for ChatGPT / Gemini / Claude-web.
+Implemented: API-key auth, the full command surface, interactive chat, local-file
+`open` (loopback serve), **`smarts login`** (device-code flow, works over SSH),
+and **`smarts mcp serve`** (local stdio MCP server).
+
+Remaining:
+- **Hosted MCP** — a Streamable-HTTP deployment at `mcp.smarts.bio` for
+  ChatGPT / Gemini / Claude-web (the same tool layer over HTTP).
 - Skill generation (`smarts skill install`).
 
 ## Releasing
