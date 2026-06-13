@@ -23,7 +23,16 @@ anyhow = "1"
 futures-util = "0.3"
 directories = "5"
 toml = "0.8"
-keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+# Linux uses the pure-Rust zbus secret-service backend (async-secret-service +
+# async-io), NOT sync-secret-service — the latter pulls libdbus (a C lib) which
+# isn't on CI and won't statically link for musl. crypto-rust avoids OpenSSL.
+keyring = { version = "3", default-features = false, features = [
+    "apple-native",
+    "windows-native",
+    "async-secret-service",
+    "async-io",
+    "crypto-rust",
+] }
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 comfy-table = "7"
 indicatif = "0.17"
