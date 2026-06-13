@@ -1,0 +1,29 @@
+[package]
+# Package name == binary name so Homebrew/installer use `smarts` (dir stays smarts-cli).
+name = "smarts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "smarts.bio command-line interface"
+
+[[bin]]
+name = "smarts"
+path = "src/main.rs"
+
+[dependencies]
+smarts-client = { path = "../smarts-client" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+comfy-table.workspace = true
+indicatif.workspace = true
+webbrowser.workspace = true
+rustyline.workspace = true
+tiny_http.workspace = true
+urlencoding.workspace = true
+mime_guess.workspace = true

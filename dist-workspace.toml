@@ -1,0 +1,37 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app.
+#   shell      → macOS/Linux  `curl … | sh`
+#   powershell → Windows       `irm … | iex`
+#   homebrew   → macOS/Linuxbrew `brew install smartsbio/tap/smarts`
+installers = ["shell", "powershell", "homebrew"]
+# GitHub repo hosting the Homebrew formula (create smartsbio/homebrew-tap).
+tap = "smartsbio/homebrew-tap"
+# Actually publish the formula to the tap on release.
+publish-jobs = ["homebrew"]
+# Target platforms to build apps for (each builds natively on its own CI runner).
+#   macOS  : Intel + Apple Silicon
+#   Linux  : glibc (desktops/HPC) + musl (fully-static, Alpine/containers) + ARM
+#   Windows: x86_64 MSVC
+# Add "aarch64-pc-windows-msvc" for ARM Windows later if needed.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Where to host releases
+hosting = "github"
+# Whether to install an updater program
+install-updater = false
