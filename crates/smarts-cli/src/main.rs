@@ -10,13 +10,14 @@ mod localopen;
 mod mcp_install;
 mod output;
 
+use std::collections::HashMap;
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde_json::{json, Value};
 use smarts_client::{resolve_path, Config, DevicePoll, SmartsClient, TokenSource};
 
@@ -172,7 +173,9 @@ enum PipelineCmd {
 struct RunInvocation {
     /// Tool or pipeline id.
     id: String,
-    /// Repeatable `key=value` input parameters (values are parsed as JSON when possible).
+    /// Repeatable `key=value` input parameters. Values are parsed as JSON when possible.
+    /// Values that look like workspace paths (`@`, `/`, `./`, `../`) are resolved against
+    /// the current dir (see `file cd`) — e.g. in /exp2, `./reads.fastq` -> `@exp2/reads.fastq`.
     #[arg(long = "param", short = 'p', value_name = "KEY=VALUE")]
     params: Vec<String>,
     /// JSON object of inputs from a file, `@file`, or `-` for stdin.
@@ -625,8 +628,13 @@ async fn cmd_tool(ctx: &Ctx, cmd: ToolCmd) -> Result<()> {
             Ok(())
         }
         ToolCmd::Run(inv) => {
-            let input = build_input(&inv)?;
             let ws = ctx.optional_workspace();
+            // Resolve path-like params against the workspace cwd (empty when no workspace).
+            let cwd = ws
+                .as_deref()
+                .map(|w| ctx.config.cwd_for(w))
+                .unwrap_or_default();
+            let input = build_input(&inv, &cwd)?;
             let result = ctx.client.run_tool(&inv.id, ws.as_deref(), input).await?;
             print_json(&result);
             Ok(())
@@ -685,7 +693,8 @@ async fn cmd_pipeline(ctx: &Ctx, cmd: PipelineCmd) -> Result<()> {
         }
         PipelineCmd::Run(inv) => {
             let ws = ctx.require_workspace()?;
-            let input = build_input(&inv)?;
+            let cwd = ctx.config.cwd_for(&ws);
+            let input = build_input(&inv, &cwd)?;
             let result = ctx.client.run_pipeline(&inv.id, &ws, input).await?;
             if ctx.json {
                 print_json(&result);
@@ -748,22 +757,151 @@ const TERMINAL_STATES: [&str; 8] = [
     "canceled",
 ];
 
+/// A pipeline step as surfaced by `GET /v1/pipelines/:id`.
+struct StepView {
+    step_id: String,
+    label: String,
+    description: String,
+    status: String,
+}
+
+/// Pull the pipeline step list out of a run-status payload (top-level or under `data`).
+/// Returns empty for non-pipeline runs (e.g. a single tool), which drives the fallback.
+fn extract_steps(resp: &Value) -> Vec<StepView> {
+    let arr = resp
+        .get("steps")
+        .and_then(Value::as_array)
+        .or_else(|| resp.pointer("/data/steps").and_then(Value::as_array));
+    let Some(arr) = arr else {
+        return Vec::new();
+    };
+    arr.iter()
+        .map(|s| {
+            let step_id = first_str(s, &["stepId", "id"]).unwrap_or_default();
+            let label = first_str(s, &["name", "toolName"]).unwrap_or_else(|| step_id.clone());
+            StepView {
+                step_id,
+                label,
+                description: first_str(s, &["description"]).unwrap_or_default(),
+                status: first_str(s, &["status"]).unwrap_or_else(|| "pending".into()),
+            }
+        })
+        .collect()
+}
+
+fn step_is_done(status: &str) -> bool {
+    matches!(
+        status.to_lowercase().as_str(),
+        "completed" | "complete" | "success" | "succeeded"
+    )
+}
+
+fn fmt_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs >= 60 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+fn spinner_style(template: &str) -> ProgressStyle {
+    ProgressStyle::with_template(template).unwrap_or_else(|_| ProgressStyle::default_spinner())
+}
+
+/// Update a step's bar: running steps keep an animated spinner; terminal/pending
+/// steps show a static status glyph. `elapsed` is a live local stopwatch (running only).
+fn apply_step_bar(bar: &ProgressBar, s: &StepView, elapsed: Option<&str>) {
+    let lower = s.status.to_lowercase();
+    let desc = if s.description.is_empty() {
+        String::new()
+    } else {
+        format!("  —  {}", truncate(&s.description, 48))
+    };
+
+    if lower == "running" {
+        bar.set_style(spinner_style("  {spinner:.cyan} {msg}"));
+        let elapsed = elapsed.map(|e| format!("  ({e})")).unwrap_or_default();
+        bar.set_message(format!("{}{desc}{elapsed}", s.label));
+    } else {
+        let glyph = match lower.as_str() {
+            "completed" | "complete" | "success" | "succeeded" => "✓",
+            "failed" | "error" => "✗",
+            "cancelled" | "canceled" => "⊘",
+            "skipped" => "–",
+            _ => "○", // pending / queued / waiting
+        };
+        let suffix = match lower.as_str() {
+            "pending" | "queued" | "waiting" => "  (pending)",
+            _ => "",
+        };
+        bar.set_style(spinner_style("  {msg}"));
+        bar.set_message(format!("{glyph} {}{desc}{suffix}", s.label));
+    }
+}
+
 async fn watch_run(ctx: &Ctx, ws: &str, id: &str, interval: u64) -> Result<()> {
-    let spinner = ProgressBar::new_spinner();
-    spinner.set_style(
-        ProgressStyle::with_template("{spinner} {msg}").unwrap_or_else(|_| ProgressStyle::default_spinner()),
-    );
-    spinner.enable_steady_tick(Duration::from_millis(120));
+    // JSON mode: poll quietly until terminal, then emit the raw payload (no live UI).
+    if ctx.json {
+        loop {
+            let resp = ctx.client.run_status(id, ws).await?;
+            let state = run_state_of(&resp).unwrap_or_else(|| "unknown".into());
+            if TERMINAL_STATES.contains(&state.to_lowercase().as_str()) {
+                print_json(&resp);
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_secs(interval.max(1))).await;
+        }
+    }
+
+    let mp = MultiProgress::new();
+    let header = mp.add(ProgressBar::new_spinner());
+    header.set_style(spinner_style("{spinner:.green} {msg}"));
+    header.enable_steady_tick(Duration::from_millis(120));
+
+    // One bar per pipeline step, created lazily once the run first reports steps.
+    let mut step_bars: Vec<(String, ProgressBar)> = Vec::new();
+    // Per-step local stopwatch (started when we first see it running) so we can show a
+    // live elapsed counter without parsing server timestamps / pulling in a date lib.
+    let mut step_clock: HashMap<String, Instant> = HashMap::new();
 
     loop {
-        let status_resp = ctx.client.run_status(id, ws).await?;
-        let state = run_state_of(&status_resp).unwrap_or_else(|| "unknown".into());
-        spinner.set_message(format!("run {id}: {state}"));
+        let resp = ctx.client.run_status(id, ws).await?;
+        let state = run_state_of(&resp).unwrap_or_else(|| "unknown".into());
+        let steps = extract_steps(&resp);
+
+        if step_bars.is_empty() && !steps.is_empty() {
+            for s in &steps {
+                let bar = mp.add(ProgressBar::new_spinner());
+                bar.enable_steady_tick(Duration::from_millis(120));
+                step_bars.push((s.step_id.clone(), bar));
+            }
+        }
+
+        let total = steps.len();
+        let done = steps.iter().filter(|s| step_is_done(&s.status)).count();
+        let counts = if total > 0 {
+            format!("  [{done}/{total}]")
+        } else {
+            String::new()
+        };
+        header.set_message(format!("run {id}  ·  {state}{counts}"));
+
+        for s in &steps {
+            if let Some((_, bar)) = step_bars.iter().find(|(sid, _)| sid == &s.step_id) {
+                if s.status.eq_ignore_ascii_case("running") {
+                    step_clock.entry(s.step_id.clone()).or_insert_with(Instant::now);
+                }
+                let elapsed = step_clock.get(&s.step_id).map(|t| fmt_duration(t.elapsed()));
+                apply_step_bar(bar, s, elapsed.as_deref());
+            }
+        }
 
         if TERMINAL_STATES.contains(&state.to_lowercase().as_str()) {
-            spinner.finish_with_message(format!("run {id}: {state}"));
-            if ctx.json {
-                print_json(&status_resp);
+            header.set_style(spinner_style("{msg}"));
+            header.finish_with_message(format!("run {id}  ·  {state}{counts}"));
+            for (_, bar) in &step_bars {
+                bar.finish();
             }
             return Ok(());
         }
@@ -1013,7 +1151,10 @@ async fn cmd_mcp(ctx: &Ctx, cmd: McpCmd) -> Result<()> {
 
 /// Build the `input` object for a tool/pipeline run from `--input` plus
 /// repeated `--param key=value` overrides.
-fn build_input(inv: &RunInvocation) -> Result<Value> {
+///
+/// `cwd` is the current workspace directory (from `file cd`); path-like `--param`
+/// values are resolved against it. Pass `""` when there is no workspace context.
+fn build_input(inv: &RunInvocation, cwd: &str) -> Result<Value> {
     let mut value = match &inv.input {
         Some(src) => {
             let text = read_input_source(src)?;
@@ -1030,7 +1171,7 @@ fn build_input(inv: &RunInvocation) -> Result<Value> {
         let (key, raw) = pair
             .split_once('=')
             .ok_or_else(|| anyhow!("invalid --param '{pair}', expected key=value"))?;
-        map.insert(key.to_string(), coerce_value(raw));
+        map.insert(key.to_string(), coerce_param_value(raw, cwd));
     }
     Ok(value)
 }
@@ -1052,6 +1193,31 @@ fn coerce_value(raw: &str) -> Value {
     serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
 }
 
+/// True when a `--param` value carries an explicit workspace-path sigil (`@`, `/`,
+/// `./`, `../`). Only such values are resolved against the cwd, so plain string
+/// params (e.g. `sampleName=samp1`) are never rewritten. A bare filename is left
+/// untouched because it is ambiguous with an ordinary string value.
+fn is_workspace_path(raw: &str) -> bool {
+    raw.starts_with('@')
+        || raw.starts_with('/')
+        || raw.starts_with("./")
+        || raw.starts_with("../")
+}
+
+/// Coerce a `--param` value, resolving workspace file paths against `cwd`.
+///
+/// A value with an explicit path sigil is normalized against the current directory and
+/// emitted in the canonical `@`-anchored form the API understands (e.g. in `/exp2`,
+/// `./test_reads.fastq` -> `@exp2/test_reads.fastq`). Everything else falls back to
+/// JSON/string coercion.
+fn coerce_param_value(raw: &str, cwd: &str) -> Value {
+    if is_workspace_path(raw) {
+        Value::String(format!("@{}", resolve_path(cwd, raw)))
+    } else {
+        coerce_value(raw)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1071,7 +1237,7 @@ mod tests {
             params: vec!["evalue=0.01".into(), "program=blastn".into()],
             input: None,
         };
-        let v = build_input(&inv).unwrap();
+        let v = build_input(&inv, "").unwrap();
         assert_eq!(v["evalue"], json!(0.01));
         assert_eq!(v["program"], json!("blastn"));
     }
@@ -1083,6 +1249,104 @@ mod tests {
             params: vec!["noequals".into()],
             input: None,
         };
-        assert!(build_input(&inv).is_err());
+        assert!(build_input(&inv, "").is_err());
+    }
+
+    #[test]
+    fn is_workspace_path_requires_explicit_sigil() {
+        assert!(is_workspace_path("@exp2/x.fastq"));
+        assert!(is_workspace_path("/exp2/x.fastq"));
+        assert!(is_workspace_path("./x.fastq"));
+        assert!(is_workspace_path("../x.fastq"));
+        // bare strings/filenames are NOT treated as paths (ambiguous with values)
+        assert!(!is_workspace_path("x.fastq"));
+        assert!(!is_workspace_path("samp1"));
+        assert!(!is_workspace_path("blastn"));
+    }
+
+    #[test]
+    fn coerce_param_resolves_relative_path_against_cwd() {
+        // In /exp2, "./test_reads.fastq" -> "@exp2/test_reads.fastq"
+        assert_eq!(
+            coerce_param_value("./test_reads.fastq", "exp2"),
+            json!("@exp2/test_reads.fastq")
+        );
+        // bare relative (no ./) is unchanged unless an explicit absolute/parent form
+        assert_eq!(
+            coerce_param_value("../shared/ref.fa", "exp2/sub"),
+            json!("@exp2/shared/ref.fa")
+        );
+    }
+
+    #[test]
+    fn coerce_param_absolute_and_at_paths_are_idempotent() {
+        // cwd is irrelevant for absolute forms
+        assert_eq!(
+            coerce_param_value("@exp2/test_reads.fastq", "other"),
+            json!("@exp2/test_reads.fastq")
+        );
+        assert_eq!(
+            coerce_param_value("/exp2/test_reads.fastq", "other"),
+            json!("@exp2/test_reads.fastq")
+        );
+    }
+
+    #[test]
+    fn coerce_param_leaves_non_paths_alone() {
+        assert_eq!(coerce_param_value("samp1", "exp2"), json!("samp1"));
+        assert_eq!(coerce_param_value("42", "exp2"), json!(42));
+        assert_eq!(coerce_param_value("true", "exp2"), json!(true));
+    }
+
+    #[test]
+    fn build_input_resolves_path_params_with_cwd() {
+        let inv = RunInvocation {
+            id: "quality-control".into(),
+            params: vec![
+                "inputFastqR1=./test_reads.fastq".into(),
+                "sampleName=samp1".into(),
+            ],
+            input: None,
+        };
+        let v = build_input(&inv, "exp2").unwrap();
+        assert_eq!(v["inputFastqR1"], json!("@exp2/test_reads.fastq"));
+        assert_eq!(v["sampleName"], json!("samp1"));
+    }
+
+    #[test]
+    fn extract_steps_parses_top_level_and_nested() {
+        let resp = json!({
+            "status": "running",
+            "steps": [
+                { "stepId": "step1_fastqc", "name": "fastqc", "description": "QC", "status": "completed" },
+                { "stepId": "step2_trim", "toolName": "trimmomatic", "status": "running" }
+            ]
+        });
+        let steps = extract_steps(&resp);
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].label, "fastqc");
+        assert_eq!(steps[0].status, "completed");
+        // falls back to toolName when name is absent
+        assert_eq!(steps[1].label, "trimmomatic");
+
+        // also reads from a `data`-wrapped payload
+        let wrapped = json!({ "data": { "steps": [ { "stepId": "s", "status": "pending" } ] } });
+        assert_eq!(extract_steps(&wrapped).len(), 1);
+    }
+
+    #[test]
+    fn extract_steps_empty_for_non_pipeline() {
+        let resp = json!({ "status": "running", "toolName": "blastn" });
+        assert!(extract_steps(&resp).is_empty());
+    }
+
+    #[test]
+    fn step_is_done_and_duration_format() {
+        assert!(step_is_done("completed"));
+        assert!(step_is_done("SUCCESS"));
+        assert!(!step_is_done("running"));
+        assert!(!step_is_done("failed"));
+        assert_eq!(fmt_duration(Duration::from_secs(45)), "45s");
+        assert_eq!(fmt_duration(Duration::from_secs(220)), "3m40s");
     }
 }

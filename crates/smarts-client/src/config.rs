@@ -85,11 +85,19 @@ impl Config {
 
 /// Resolve a `cd`-style target against a workspace-relative current directory.
 ///
-/// - a leading `/` resets to workspace root
+/// - a leading `/` or `@` resets to workspace root (`@` is the wire convention the API
+///   uses for workspace-relative file keys, so we treat `@foo` the same as `/foo`)
 /// - `.` is a no-op, `..` pops one segment (clamped at root — never escapes)
 /// - the result is always workspace-relative with no leading/trailing slash
 pub fn resolve_path(cwd: &str, target: &str) -> String {
-    let mut parts: Vec<&str> = if target.starts_with('/') {
+    // A leading '@' or '/' anchors at the workspace root; strip the '@' so the first
+    // segment is the folder name (e.g. "@exp2/x" -> root + ["exp2", "x"]).
+    let (is_absolute, target) = match target.strip_prefix('@') {
+        Some(rest) => (true, rest),
+        None => (target.starts_with('/'), target),
+    };
+
+    let mut parts: Vec<&str> = if is_absolute {
         Vec::new()
     } else {
         cwd.split('/').filter(|s| !s.is_empty()).collect()
@@ -134,5 +142,21 @@ mod tests {
     fn dot_is_noop_and_trailing_slashes_ignored() {
         assert_eq!(resolve_path("a", "./b/"), "a/b");
         assert_eq!(resolve_path("a//b", "c"), "a/b/c");
+    }
+
+    #[test]
+    fn at_prefix_anchors_at_root() {
+        // '@' behaves like '/': absolute from the workspace root, ignoring cwd.
+        assert_eq!(resolve_path("exp2", "@other/x"), "other/x");
+        assert_eq!(resolve_path("deep/nested", "@exp2/test_reads.fastq"), "exp2/test_reads.fastq");
+        // resolving an already-absolute '@' path is idempotent (cwd is irrelevant)
+        assert_eq!(resolve_path("", "@exp2/test_reads.fastq"), "exp2/test_reads.fastq");
+        assert_eq!(resolve_path("anything", "@"), "");
+    }
+
+    #[test]
+    fn relative_paths_join_against_cwd() {
+        assert_eq!(resolve_path("exp2", "./test_reads.fastq"), "exp2/test_reads.fastq");
+        assert_eq!(resolve_path("exp2/sub", "../test_reads.fastq"), "exp2/test_reads.fastq");
     }
 }
