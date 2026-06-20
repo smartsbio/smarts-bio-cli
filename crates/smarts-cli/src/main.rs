@@ -763,6 +763,7 @@ struct StepView {
     label: String,
     description: String,
     status: String,
+    error: Option<String>,
 }
 
 /// Pull the pipeline step list out of a run-status payload (top-level or under `data`).
@@ -779,14 +780,71 @@ fn extract_steps(resp: &Value) -> Vec<StepView> {
         .map(|s| {
             let step_id = first_str(s, &["stepId", "id"]).unwrap_or_default();
             let label = first_str(s, &["name", "toolName"]).unwrap_or_else(|| step_id.clone());
+            // Build a concise "CODE — message" error string when the step carries one.
+            let error = s.get("error").filter(|e| !e.is_null()).and_then(|e| {
+                match (first_str(e, &["code"]), first_str(e, &["message"])) {
+                    (Some(c), Some(m)) => Some(format!("{c} — {m}")),
+                    (None, Some(m)) => Some(m),
+                    (Some(c), None) => Some(c),
+                    _ => None,
+                }
+            });
             StepView {
                 step_id,
                 label,
                 description: first_str(s, &["description"]).unwrap_or_default(),
                 status: first_str(s, &["status"]).unwrap_or_else(|| "pending".into()),
+                error,
             }
         })
         .collect()
+}
+
+/// Print a compact end-of-run summary for a pipeline: outcome + duration, any failed
+/// step(s) with their error, and where the outputs landed. No-op for non-pipeline runs.
+fn print_run_summary(state: &str, resp: &Value, steps: &[StepView]) {
+    if steps.is_empty() {
+        return;
+    }
+    let lower = state.to_lowercase();
+    let succeeded = matches!(lower.as_str(), "completed" | "complete" | "success" | "succeeded");
+    let dur = resp
+        .get("durationMs")
+        .and_then(Value::as_u64)
+        .map(|ms| format!(" in {}", fmt_duration(Duration::from_millis(ms))))
+        .unwrap_or_default();
+
+    println!();
+    let outcome = match lower.as_str() {
+        _ if succeeded => format!("✓ Pipeline completed{dur}"),
+        "failed" | "error" => format!("✗ Pipeline failed{dur}"),
+        "cancelled" | "canceled" => format!("⊘ Pipeline cancelled{dur}"),
+        other => format!("Pipeline {other}{dur}"),
+    };
+    println!("{outcome}");
+
+    // On a non-success outcome, surface the failing step(s) and their error.
+    if !succeeded {
+        for s in steps
+            .iter()
+            .filter(|s| matches!(s.status.to_lowercase().as_str(), "failed" | "error"))
+        {
+            match &s.error {
+                Some(e) => println!("  ✗ {}: {e}", s.label),
+                None => println!("  ✗ {} failed", s.label),
+            }
+        }
+    }
+
+    // Where the outputs landed, plus a ready-to-run browse command.
+    if let Some(folder) = resp
+        .get("outputFolder")
+        .and_then(Value::as_str)
+        .filter(|f| !f.is_empty())
+    {
+        println!("  Outputs: /pipelines/{folder}/");
+        println!("  Browse:  smarts file ls /pipelines/{folder}");
+    }
 }
 
 fn step_is_done(status: &str) -> bool {
@@ -903,6 +961,7 @@ async fn watch_run(ctx: &Ctx, ws: &str, id: &str, interval: u64) -> Result<()> {
             for (_, bar) in &step_bars {
                 bar.finish();
             }
+            print_run_summary(&state, &resp, &steps);
             return Ok(());
         }
         tokio::time::sleep(Duration::from_secs(interval.max(1))).await;
@@ -1338,6 +1397,21 @@ mod tests {
     fn extract_steps_empty_for_non_pipeline() {
         let resp = json!({ "status": "running", "toolName": "blastn" });
         assert!(extract_steps(&resp).is_empty());
+    }
+
+    #[test]
+    fn extract_steps_captures_step_error() {
+        let resp = json!({
+            "status": "failed",
+            "steps": [
+                { "stepId": "s1", "name": "fastqc", "status": "completed", "error": null },
+                { "stepId": "s2", "name": "trimmomatic", "status": "failed",
+                  "error": { "code": "QUOTA_EXCEEDED", "message": "Compute quota exceeded" } }
+            ]
+        });
+        let steps = extract_steps(&resp);
+        assert_eq!(steps[0].error, None);
+        assert_eq!(steps[1].error.as_deref(), Some("QUOTA_EXCEEDED — Compute quota exceeded"));
     }
 
     #[test]
