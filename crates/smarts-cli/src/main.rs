@@ -196,7 +196,7 @@ enum RunCmd {
     Watch {
         id: String,
         /// Poll interval in seconds.
-        #[arg(long, default_value_t = 5)]
+        #[arg(long, default_value_t = 10)]
         interval: u64,
     },
     /// Cancel a run.
