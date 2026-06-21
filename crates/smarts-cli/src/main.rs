@@ -658,6 +658,53 @@ fn tools_json(tools: &[smarts_client::models::ToolInfo]) -> Vec<Value> {
 
 // ---- Pipelines & Runs -----------------------------------------------------
 
+/// Human-friendly render of a pipeline definition: name/description, the input schema
+/// (param name, required, default, description) and the step list, plus a run hint.
+fn render_pipeline_def(def: &Value) {
+    let id = first_str(def, &["id", "pipelineId"]).unwrap_or_default();
+    let name = first_str(def, &["name"]).unwrap_or_else(|| id.clone());
+    println!("{name}  ({id})");
+    if let Some(desc) = first_str(def, &["description"]) {
+        println!("{desc}");
+    }
+
+    if let Some(inputs) = def.get("inputs").and_then(Value::as_array).filter(|a| !a.is_empty()) {
+        println!("\nInputs:");
+        let mut t = table(&["param", "required", "default", "description"]);
+        for inp in inputs {
+            let pname = first_str(inp, &["name"]).unwrap_or_default();
+            let default_val = inp.get("default").filter(|v| !v.is_null());
+            let required = if default_val.is_some() { "no" } else { "yes" };
+            let default_str = default_val
+                .map(|v| match v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+                .unwrap_or_default();
+            let pdesc = first_str(inp, &["description"]).unwrap_or_default();
+            t.add_row(vec![pname, required.to_string(), default_str, truncate(&pdesc, 70)]);
+        }
+        println!("{t}");
+    }
+
+    if let Some(steps) = def.get("steps").and_then(Value::as_array).filter(|a| !a.is_empty()) {
+        println!("\nSteps:");
+        for (i, s) in steps.iter().enumerate() {
+            let tool = first_str(s, &["toolName"]).unwrap_or_default();
+            let sdesc = first_str(s, &["description"]).unwrap_or_default();
+            if sdesc.is_empty() {
+                println!("  {}. {tool}", i + 1);
+            } else {
+                println!("  {}. {tool}  —  {}", i + 1, truncate(&sdesc, 70));
+            }
+        }
+    }
+
+    if !id.is_empty() {
+        println!("\nRun:  smarts pipeline run {id} --param <name>=<value> ...");
+    }
+}
+
 async fn cmd_pipeline(ctx: &Ctx, cmd: PipelineCmd) -> Result<()> {
     match cmd {
         PipelineCmd::List => {
@@ -681,15 +728,31 @@ async fn cmd_pipeline(ctx: &Ctx, cmd: PipelineCmd) -> Result<()> {
             Ok(())
         }
         PipelineCmd::Show { pipeline_id } => {
-            let defs = ctx.client.list_pipeline_defs().await?;
-            let item = extract_array(&defs).into_iter().find(|it| {
-                first_str(it, &["id", "pipelineId", "_id"]).as_deref() == Some(pipeline_id.as_str())
-            });
-            match item {
-                Some(it) => print_json(&it),
-                None => bail!("pipeline '{pipeline_id}' not found"),
+            // Prefer the agent's real definition (the actual input schema + steps) over the
+            // catalog metadata, so users see exactly which parameters to pass.
+            match ctx.client.get_pipeline_def(&pipeline_id).await {
+                Ok(def) if def.get("inputs").is_some() || def.get("steps").is_some() => {
+                    if ctx.json {
+                        print_json(&def);
+                    } else {
+                        render_pipeline_def(&def);
+                    }
+                    Ok(())
+                }
+                // Fallback: catalog-metadata lookup (older gateway, or a non-agent pipeline).
+                _ => {
+                    let defs = ctx.client.list_pipeline_defs().await?;
+                    let item = extract_array(&defs).into_iter().find(|it| {
+                        first_str(it, &["id", "pipelineId", "_id"]).as_deref()
+                            == Some(pipeline_id.as_str())
+                    });
+                    match item {
+                        Some(it) => print_json(&it),
+                        None => bail!("pipeline '{pipeline_id}' not found"),
+                    }
+                    Ok(())
+                }
             }
-            Ok(())
         }
         PipelineCmd::Run(inv) => {
             let ws = ctx.require_workspace()?;

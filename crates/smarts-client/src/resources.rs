@@ -113,6 +113,13 @@ impl SmartsClient {
         self.get("/v1/catalog/pipelines", &[]).await
     }
 
+    /// Full definition for one pipeline (`GET /v1/catalog/pipelines/:id`, public).
+    /// Unlike the list, this returns the agent's real schema — `inputs[]` (names, defaults,
+    /// descriptions) and `steps[]` — i.e. exactly what to pass to `pipeline run`.
+    pub async fn get_pipeline_def(&self, pipeline_id: &str) -> Result<Value> {
+        self.get(&format!("/v1/catalog/pipelines/{pipeline_id}"), &[]).await
+    }
+
     /// Start a pipeline run (`POST /v1/pipelines`); returns the run record.
     pub async fn run_pipeline(
         &self,
