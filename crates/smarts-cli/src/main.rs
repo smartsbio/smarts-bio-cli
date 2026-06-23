@@ -636,7 +636,22 @@ async fn cmd_tool(ctx: &Ctx, cmd: ToolCmd) -> Result<()> {
                 .unwrap_or_default();
             let input = build_input(&inv, &cwd)?;
             let result = ctx.client.run_tool(&inv.id, ws.as_deref(), input).await?;
-            print_json(&result);
+            if ctx.json {
+                print_json(&result);
+                return Ok(());
+            }
+            // Unwrap the tool-result envelope ({ result: { data, metadata }, status }) down to
+            // the payload so output matches `pipeline run`: async tools (BLAST, Boltz, …) that
+            // submit a background job carry a `processId` — print the clean "Started run <id>"
+            // line. Synchronous tools print just their data payload, not the metadata noise.
+            let payload = result
+                .pointer("/result/data")
+                .or_else(|| result.pointer("/data"))
+                .unwrap_or(&result);
+            match payload.get("processId").and_then(Value::as_str) {
+                Some(id) => println!("Started run {id}"),
+                None => print_json(payload),
+            }
             Ok(())
         }
     }
@@ -866,10 +881,21 @@ fn extract_steps(resp: &Value) -> Vec<StepView> {
 /// Print a compact end-of-run summary for a pipeline: outcome + duration, any failed
 /// step(s) with their error, and where the outputs landed. No-op for non-pipeline runs.
 fn print_run_summary(state: &str, resp: &Value, steps: &[StepView]) {
+    let lower = state.to_lowercase();
+
+    // Single (non-pipeline) runs have no steps — still surface the outcome and the failure
+    // reason (e.g. a quota block) so the user isn't left guessing why a run ended.
     if steps.is_empty() {
+        match lower.as_str() {
+            "failed" | "error" => match run_error_of(resp) {
+                Some(e) => println!("\n✗ Run failed: {e}"),
+                None => println!("\n✗ Run failed"),
+            },
+            "cancelled" | "canceled" => println!("\n⊘ Run cancelled"),
+            _ => {}
+        }
         return;
     }
-    let lower = state.to_lowercase();
     let succeeded = matches!(lower.as_str(), "completed" | "complete" | "success" | "succeeded");
     let dur = resp
         .get("durationMs")
@@ -1038,6 +1064,30 @@ fn run_id_of(value: &Value) -> Option<String> {
         }
     }
     first_str(value, &["processId", "id", "_id"])
+}
+
+/// Pull a human-readable failure reason out of a run-status payload. The error may be a
+/// plain string or an object `{ code, message, details }`, and may sit at the top level,
+/// under `/data`, or under `/execution` (depending on whether the gateway normalized it).
+/// This is what surfaces "Compute quota exceeded" etc. instead of a bare "failed".
+fn run_error_of(value: &Value) -> Option<String> {
+    for base in ["/error", "/data/error", "/execution/error"] {
+        match value.pointer(base) {
+            Some(Value::String(s)) if !s.is_empty() => return Some(s.clone()),
+            Some(obj @ Value::Object(_)) => {
+                let msg = first_str(obj, &["message"]);
+                let code = first_str(obj, &["code"]);
+                match (code, msg) {
+                    (Some(c), Some(m)) => return Some(format!("{m} ({c})")),
+                    (_, Some(m)) => return Some(m),
+                    (Some(c), _) => return Some(c),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn run_state_of(value: &Value) -> Option<String> {
