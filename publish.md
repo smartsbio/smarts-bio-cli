@@ -1,3 +1,30 @@
+Full clean-up
+
+# 1) remove the Homebrew install
+brew uninstall smarts
+
+# 2) remove your local cargo build (otherwise `smarts` still resolves to it)
+cargo uninstall smarts            # or: rm ~/.cargo/bin/smarts
+
+# 3) verify nothing's left
+which -a smarts                   # should print nothing
+smarts --version                  # should say: command not found
+Optional, for an even more authentic "first-time user" recording:
+
+
+# remove the tap so the install command re-adds it on camera (brew install auto-taps anyway)
+brew untap smartsbio/tap
+
+# wipe local config + saved login so you can demo `smarts login` from scratch
+rm -rf ~/.config/smarts
+# (credentials are in the macOS keychain — `smarts logout` clears them, but it's gone now,
+#  so just delete the "smarts"/"smartsbio" item in Keychain Access if you want a pristine login demo)
+
+
+-----------------------------------------------------
+
+
+
 # publish.md — smarts CLI build / run / release cheatsheet
 
 All commands run from the repo root: `smarts-bio-cli/`.

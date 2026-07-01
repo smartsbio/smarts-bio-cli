@@ -243,8 +243,11 @@ async fn handle_image(ctx: &Ctx, workspace: Option<&str>, alt: &str, target: &st
     // clean `<stem>.<ext>` name derived from the source file rather than the
     // timestamped render key (e.g. `info_test.csv` → `info_test.png`).
     let ext = name.rsplit_once('.').map(|(_, e)| e).unwrap_or("png");
-    let stem_src = if alt.is_empty() { name.as_str() } else { alt };
-    let stem = stem_src.rsplit_once('.').map(|(s, _)| s).unwrap_or(stem_src);
+    // `alt` may be a nested workspace path (e.g. "exp2/test_gatk.bam") — take only
+    // its file name, otherwise the derived local path lands in a cwd subdirectory
+    // that doesn't exist and the write silently fails.
+    let stem_src = basename(if alt.is_empty() { name.as_str() } else { alt });
+    let stem = stem_src.rsplit_once('.').map(|(s, _)| s).unwrap_or(stem_src.as_str());
     let filename = format!("{stem}.{ext}");
     let dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let path = dir.join(&filename);
