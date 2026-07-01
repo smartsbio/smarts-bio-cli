@@ -145,11 +145,127 @@ async fn turn(
     if let Some(msg) = error_message {
         println!("\x1b[31m⚠ {msg}\x1b[0m\n");
     } else if let Some(answer) = final_answer {
-        println!("{answer}\n");
+        // The agent embeds rendered visualizations as markdown images pointing at
+        // an `s3://…` key (or a signed URL). Printing that raw is useless in a
+        // terminal, so download each referenced image, open it locally, and
+        // replace the markdown with a friendly line — mirroring `file render`.
+        let rendered = render_answer(ctx, workspace, &answer).await;
+        println!("{rendered}\n");
     } else {
         println!("(no answer received)\n");
     }
     Ok(())
+}
+
+/// Post-process an agent answer for the terminal:
+///   * markdown images `![alt](target)` → download the file and open it locally;
+///   * markdown links  `[text](s3://…)`  → resolve the `s3://` key to a working
+///     signed URL and show it inline (a raw `s3://` is useless in a terminal).
+/// All other text — including ordinary `[text](https://…)` links — is untouched.
+async fn render_answer(ctx: &Ctx, workspace: Option<&str>, answer: &str) -> String {
+    let mut out = String::new();
+    let mut rest = answer;
+    while let Some(open) = rest.find('[') {
+        // A markdown image is a link preceded by '!'.
+        let is_image = open > 0 && rest.as_bytes()[open - 1] == b'!';
+        let after = &rest[open..]; // starts at '['
+
+        // Parse `[text](target)`.
+        let parsed = after.find("](").and_then(|text_end| {
+            let url_start = text_end + 2;
+            after[url_start..]
+                .find(')')
+                .map(|rel| (&after[1..text_end], &after[url_start..url_start + rel], url_start + rel + 1))
+        });
+
+        match parsed {
+            Some((text, target, consumed)) => {
+                // For images, also drop the leading '!' from the emitted prefix.
+                let prefix_end = if is_image { open - 1 } else { open };
+                out.push_str(&rest[..prefix_end]);
+
+                let replacement = if is_image {
+                    handle_image(ctx, workspace, text, target)
+                        .await
+                        .unwrap_or_else(|| format!("[image: {}]", if text.is_empty() { target } else { text }))
+                } else {
+                    // Only rewrite s3:// links; leave normal links exactly as-is.
+                    handle_link(ctx, workspace, text, target)
+                        .await
+                        .unwrap_or_else(|| format!("[{text}]({target})"))
+                };
+                out.push_str(&replacement);
+                rest = &after[consumed..];
+            }
+            None => {
+                // Not a complete token — emit up to and including '[' and continue
+                // so the scan always advances (no infinite loop).
+                out.push_str(&rest[..open + 1]);
+                rest = &after[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Resolve an `s3://<key>` markdown link to a working signed URL and format it
+/// as `text: <url>`. Returns `None` for non-`s3://` targets (kept verbatim) or
+/// when the key can't be resolved.
+async fn handle_link(ctx: &Ctx, workspace: Option<&str>, text: &str, target: &str) -> Option<String> {
+    let key = target.strip_prefix("s3://")?;
+    let ws = workspace
+        .map(str::to_string)
+        .or_else(|| parse_workspace_from_key(key))?;
+    let url = ctx.client.download_url(&ws, key).await.ok()?;
+    let label = if text.is_empty() { basename(key) } else { text.to_string() };
+    Some(format!("{label}: {url}"))
+}
+
+/// Download the image a markdown reference points at, save it to a temp file,
+/// open it in the default viewer, and return a one-line summary. Returns `None`
+/// if the target isn't fetchable (the caller then falls back to alt text).
+async fn handle_image(ctx: &Ctx, workspace: Option<&str>, alt: &str, target: &str) -> Option<String> {
+    let (bytes, name) = if let Some(key) = target.strip_prefix("s3://") {
+        let ws = workspace
+            .map(str::to_string)
+            .or_else(|| parse_workspace_from_key(key))?;
+        let bytes = ctx.client.download_bytes(&ws, key).await.ok()?;
+        (bytes, basename(key))
+    } else if target.starts_with("http://") || target.starts_with("https://") {
+        let bytes = ctx.client.fetch_url_bytes(target).await.ok()?;
+        (bytes, basename(target.split('?').next().unwrap_or(target)))
+    } else {
+        return None;
+    };
+
+    let path = std::env::temp_dir().join(&name);
+    std::fs::write(&path, &bytes).ok()?;
+    let _ = webbrowser::open(&path.to_string_lossy());
+
+    let label = if alt.is_empty() { name.as_str() } else { alt };
+    Some(format!(
+        "🖼  {label} — {} ({}, opened)",
+        path.display(),
+        crate::output::human_size(bytes.len() as u64),
+    ))
+}
+
+/// Extract the workspace id from a storage key like
+/// `organizations/<org>/workspaces/<ws>/files/…`.
+fn parse_workspace_from_key(key: &str) -> Option<String> {
+    let mut segs = key.split('/');
+    while let Some(seg) = segs.next() {
+        if seg == "workspaces" {
+            return segs.next().map(str::to_string);
+        }
+    }
+    None
+}
+
+/// Final path segment (the file name) of a `/`-separated key or URL path.
+fn basename(path: &str) -> String {
+    path.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or("image").to_string()
 }
 
 /// Handle a `/slash` command. Returns `true` when the chat should exit.
