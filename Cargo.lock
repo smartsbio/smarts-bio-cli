@@ -2395,6 +2395,7 @@ name = "smarts-mcp"
 version = "0.1.8"
 dependencies = [
  "anyhow",
+ "base64",
  "rmcp",
  "schemars",
  "serde",

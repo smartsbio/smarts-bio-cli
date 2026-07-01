@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use base64::Engine;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -22,6 +23,12 @@ use smarts_client::SmartsClient;
 
 /// Max bytes returned by `smarts_read_file` (keeps responses sane for big files).
 const MAX_READ_BYTES: usize = 100 * 1024;
+
+/// Max bytes of an image embedded inline in a query answer (~1 MB of base64);
+/// larger images keep just their signed URL to keep the tool payload bounded.
+const MAX_INLINE_IMAGE_BYTES: usize = 750 * 1024;
+/// Max images inlined per query answer.
+const MAX_INLINE_IMAGES: usize = 4;
 
 #[derive(Clone)]
 pub struct SmartsMcp {
@@ -159,7 +166,101 @@ impl SmartsMcp {
             .or_else(|| resp.get("response").and_then(Value::as_str))
             .map(str::to_string)
             .unwrap_or_else(|| serde_json::to_string_pretty(&resp).unwrap_or_default());
-        Ok(CallToolResult::success(vec![Content::text(answer)]))
+        let content = self.enrich_answer(&answer, ws.as_deref()).await;
+        Ok(CallToolResult::success(content))
+    }
+
+    /// Turn a raw agent answer into MCP content. The agent embeds rendered
+    /// visualizations as markdown pointing at an `s3://…` storage key —
+    /// `![alt](s3://…)` for images, `[text](s3://…)` for files. A remote host
+    /// can't resolve a raw `s3://` reference, so we rewrite every `s3://` target
+    /// to a signed https URL and, for image refs, also attach an inline image
+    /// block (bounded by size + count) so the figure renders in the chat.
+    async fn enrich_answer(&self, answer: &str, workspace: Option<&str>) -> Vec<Content> {
+        let mut text_out = String::new();
+        let mut images: Vec<Content> = Vec::new();
+        let mut rest = answer;
+
+        while let Some(open) = rest.find('[') {
+            // A markdown image is a link preceded by '!'.
+            let is_image = open > 0 && rest.as_bytes()[open - 1] == b'!';
+            let after = &rest[open..]; // starts at '['
+
+            // Parse `[text](target)`.
+            let parsed = after.find("](").and_then(|text_end| {
+                let url_start = text_end + 2;
+                after[url_start..].find(')').map(|rel| {
+                    (
+                        &after[1..text_end],
+                        &after[url_start..url_start + rel],
+                        url_start + rel + 1,
+                    )
+                })
+            });
+
+            match parsed {
+                Some((label, target, consumed)) => {
+                    let prefix_end = if is_image { open - 1 } else { open };
+                    text_out.push_str(&rest[..prefix_end]);
+
+                    // Rewrite s3:// → signed URL (images and links alike); leave
+                    // every other target exactly as the agent wrote it.
+                    let signed = self.sign_s3(workspace, target).await;
+                    let shown = signed.as_deref().unwrap_or(target);
+                    let prefix = if is_image { "!" } else { "" };
+                    text_out.push_str(&format!("{prefix}[{label}]({shown})"));
+
+                    // For images, also inline the bytes (bounded).
+                    if is_image && images.len() < MAX_INLINE_IMAGES {
+                        let fetch = if target.starts_with("s3://") {
+                            signed
+                        } else if target.starts_with("http://") || target.starts_with("https://") {
+                            Some(target.to_string())
+                        } else {
+                            None
+                        };
+                        if let Some(url) = fetch {
+                            if let Some(c) = self.inline_image(&url, target).await {
+                                images.push(c);
+                            }
+                        }
+                    }
+                    rest = &after[consumed..];
+                }
+                None => {
+                    // Not a complete token — emit up to and including '[' and
+                    // continue so the scan always advances (no infinite loop).
+                    text_out.push_str(&rest[..open + 1]);
+                    rest = &after[1..];
+                }
+            }
+        }
+        text_out.push_str(rest);
+
+        let mut content = vec![Content::text(text_out)];
+        content.extend(images);
+        content
+    }
+
+    /// Resolve an `s3://<key>` target to a signed https URL. `None` when the
+    /// target isn't an `s3://` ref or the key can't be resolved.
+    async fn sign_s3(&self, workspace: Option<&str>, target: &str) -> Option<String> {
+        let key = target.strip_prefix("s3://")?;
+        let ws = workspace
+            .map(str::to_string)
+            .or_else(|| parse_workspace_from_key(key))?;
+        self.client.download_url(&ws, key).await.ok()
+    }
+
+    /// Fetch image bytes from a URL and build a bounded inline image block.
+    /// `None` if the fetch fails or the image exceeds the size cap.
+    async fn inline_image(&self, url: &str, name_hint: &str) -> Option<Content> {
+        let bytes = self.client.fetch_url_bytes(url).await.ok()?;
+        if bytes.is_empty() || bytes.len() > MAX_INLINE_IMAGE_BYTES {
+            return None;
+        }
+        let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        Some(Content::image(data, guess_image_mime(name_hint)))
     }
 
     #[tool(description = "List the available bioinformatics tools (BLAST, GATK, NCBI lookups, etc.), optionally filtered by category.")]
@@ -352,6 +453,38 @@ pub async fn serve_stdio(
 
 fn to_mcp_err(e: smarts_client::Error) -> McpError {
     McpError::internal_error(e.to_string(), None)
+}
+
+/// Extract the workspace id from a storage key like
+/// `organizations/<org>/workspaces/<ws>/files/…`.
+fn parse_workspace_from_key(key: &str) -> Option<String> {
+    let mut segs = key.split('/');
+    while let Some(seg) = segs.next() {
+        if seg == "workspaces" {
+            return segs.next().map(str::to_string);
+        }
+    }
+    None
+}
+
+/// Best-effort image MIME type from a key/URL extension (defaults to PNG).
+fn guess_image_mime(name: &str) -> String {
+    let ext = name
+        .split('?')
+        .next()
+        .unwrap_or(name)
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        _ => "image/png",
+    }
+    .to_string()
 }
 
 fn json_result<T: serde::Serialize>(value: &T) -> Result<CallToolResult, McpError> {
