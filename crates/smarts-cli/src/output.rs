@@ -3,6 +3,30 @@
 use comfy_table::{ContentArrangement, Table};
 use serde_json::Value;
 
+/// Open a **local file** with the OS default application for its type (Preview
+/// for images, the associated app for PDFs/SVGs, etc.) — not the web browser.
+/// Use this for files we've written to disk; URLs should still go through the
+/// `webbrowser` crate so they land in the default browser.
+pub fn open_with_default_app(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(path).status().map(|_| ())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // `start` is a cmd builtin; the empty "" is its (required) window-title arg.
+        std::process::Command::new("cmd")
+            .args(["/C", "start", ""])
+            .arg(path)
+            .status()
+            .map(|_| ())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open").arg(path).status().map(|_| ())
+    }
+}
+
 /// Print a value as pretty JSON (used for `--json` and for passthrough shapes).
 pub fn print_json(value: &Value) {
     println!(

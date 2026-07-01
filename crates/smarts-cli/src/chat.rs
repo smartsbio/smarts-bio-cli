@@ -239,11 +239,21 @@ async fn handle_image(ctx: &Ctx, workspace: Option<&str>, alt: &str, target: &st
         return None;
     };
 
-    let path = std::env::temp_dir().join(&name);
+    // Save into the current working directory (matching `file render`), using a
+    // clean `<stem>.<ext>` name derived from the source file rather than the
+    // timestamped render key (e.g. `info_test.csv` → `info_test.png`).
+    let ext = name.rsplit_once('.').map(|(_, e)| e).unwrap_or("png");
+    let stem_src = if alt.is_empty() { name.as_str() } else { alt };
+    let stem = stem_src.rsplit_once('.').map(|(s, _)| s).unwrap_or(stem_src);
+    let filename = format!("{stem}.{ext}");
+    let dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let path = dir.join(&filename);
     std::fs::write(&path, &bytes).ok()?;
-    let _ = webbrowser::open(&path.to_string_lossy());
+    // Open with the OS default app for the file type (Preview for images, etc.),
+    // not the web browser.
+    let _ = crate::output::open_with_default_app(&path);
 
-    let label = if alt.is_empty() { name.as_str() } else { alt };
+    let label = if alt.is_empty() { filename.as_str() } else { alt };
     Some(format!(
         "🖼  {label} — {} ({}, opened)",
         path.display(),

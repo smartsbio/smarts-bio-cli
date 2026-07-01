@@ -1260,7 +1260,9 @@ async fn cmd_file(ctx: &mut Ctx, cmd: FileCmd) -> Result<()> {
                 .with_context(|| format!("creating {}", out.display()))?
                 .write_all(&bytes)?;
             println!("Rendered {key} ({}) → {}", human_size(bytes.len() as u64), out.display());
-            if let Err(e) = webbrowser::open(&out.to_string_lossy()) {
+            // Open with the OS default app for the file type (Preview for images,
+            // etc.), not the web browser.
+            if let Err(e) = output::open_with_default_app(&out) {
                 eprintln!("saved but could not open it ({e})");
             }
             Ok(())
