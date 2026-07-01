@@ -230,6 +230,25 @@ enum FileCmd {
         #[arg(long)]
         print_url: bool,
     },
+    /// Render a workspace file to a static image (PNG/SVG) and save/open it.
+    Render {
+        target: String,
+        /// Image format: png (default) or svg.
+        #[arg(long, default_value = "png")]
+        format: String,
+        /// Optional region — sequence "start-end" or genomic "chrom:start-end".
+        #[arg(long)]
+        region: Option<String>,
+        /// CSV charts only: chart type (bar-v, line, scatter, pie, heatmap-2d, boxplot, violin, …).
+        #[arg(long)]
+        chart_type: Option<String>,
+        /// Write the image to this path (defaults to the file's name).
+        #[arg(short = 'o', long)]
+        output: Option<PathBuf>,
+        /// Print the full-resolution image URL instead of saving/opening.
+        #[arg(long)]
+        print_url: bool,
+    },
     /// Create a folder in the current directory.
     Mkdir { name: String },
     /// Move a file to another folder.
@@ -1205,6 +1224,44 @@ async fn cmd_file(ctx: &mut Ctx, cmd: FileCmd) -> Result<()> {
             println!("Opening {url}");
             if let Err(e) = webbrowser::open(&url) {
                 eprintln!("could not open a browser ({e}); URL: {url}");
+            }
+            Ok(())
+        }
+        FileCmd::Render { target, format, region, chart_type, output, print_url } => {
+            let key = resolve_file_key(ctx, &ws, &cwd, &target).await?;
+            let resp = ctx
+                .client
+                .render_view(&ws, &key, Some(&format), region.as_deref(), chart_type.as_deref())
+                .await?;
+            if ctx.json {
+                print_json(&resp);
+                return Ok(());
+            }
+            let image_url = resp
+                .get("image_url")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if print_url {
+                println!("{image_url}");
+                return Ok(());
+            }
+            if image_url.is_empty() {
+                bail!("render did not return an image URL");
+            }
+            let fmt = resp.get("format").and_then(Value::as_str).unwrap_or(&format);
+            let out = output.unwrap_or_else(|| {
+                let name = key.rsplit('/').next().unwrap_or("render");
+                let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
+                PathBuf::from(format!("{stem}.{fmt}"))
+            });
+            let bytes = ctx.client.fetch_url_bytes(&image_url).await?;
+            std::fs::File::create(&out)
+                .with_context(|| format!("creating {}", out.display()))?
+                .write_all(&bytes)?;
+            println!("Rendered {key} ({}) → {}", human_size(bytes.len() as u64), out.display());
+            if let Err(e) = webbrowser::open(&out.to_string_lossy()) {
+                eprintln!("saved but could not open it ({e})");
             }
             Ok(())
         }

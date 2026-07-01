@@ -98,6 +98,24 @@ struct FileKeyArgs {
     workspace_id: Option<String>,
 }
 
+#[derive(Deserialize, JsonSchema)]
+struct ViewImageArgs {
+    /// Storage key of the file to render.
+    key: String,
+    #[serde(default)]
+    workspace_id: Option<String>,
+    /// Image format: "png" (default) or "svg".
+    #[serde(default)]
+    format: Option<String>,
+    /// Optional region — sequence "start-end" or genomic "chrom:start-end".
+    #[serde(default)]
+    region: Option<String>,
+    /// For CSV/TSV files only: chart type (bar-v, bar-stacked, line, scatter, pie,
+    /// donut, heatmap-2d, boxplot, violin, hist, …). Omit to auto-pick.
+    #[serde(default)]
+    chart_type: Option<String>,
+}
+
 // ---- Tools ----------------------------------------------------------------
 
 #[tool_router]
@@ -257,6 +275,37 @@ impl SmartsMcp {
             .await
             .map_err(to_mcp_err)?;
         Ok(CallToolResult::success(vec![Content::text(url)]))
+    }
+
+    #[tool(
+        description = "Render a workspace file as a static image (PNG/SVG) that looks exactly like the interactive viewer — a heatmap/chart from a CSV, a FASTA region, a PDB structure, BAM coverage, VCF variants. Returns the image inline so you can show it to the user directly, plus a full-resolution URL. Use smarts_open_file for an interactive link instead."
+    )]
+    async fn smarts_view_as_image(
+        &self,
+        params: Parameters<ViewImageArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let a = params.0;
+        let ws = self.require_workspace(a.workspace_id)?;
+        let resp = self
+            .client
+            .render_view(&ws, &a.key, a.format.as_deref(), a.region.as_deref(), a.chart_type.as_deref())
+            .await
+            .map_err(to_mcp_err)?;
+        let data = resp
+            .get("thumbnail_base64")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let mime = resp
+            .get("thumbnail_mime_type")
+            .and_then(Value::as_str)
+            .unwrap_or("image/png")
+            .to_string();
+        let mut content = vec![Content::image(data, mime)];
+        if let Some(url) = resp.get("image_url").and_then(Value::as_str) {
+            content.push(Content::text(format!("Full-resolution image: {url}")));
+        }
+        Ok(CallToolResult::success(content))
     }
 
     #[tool(description = "List the workspaces the authenticated user can access.")]

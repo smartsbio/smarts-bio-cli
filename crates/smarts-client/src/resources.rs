@@ -206,10 +206,15 @@ impl SmartsClient {
     /// Resolve a download URL and fetch the file bytes (presigned S3 GET, no auth).
     pub async fn download_bytes(&self, workspace_id: &str, key: &str) -> Result<Vec<u8>> {
         let url = self.download_url(workspace_id, key).await?;
-        let resp = self.raw().get(&url).send().await?;
+        self.fetch_url_bytes(&url).await
+    }
+
+    /// Fetch raw bytes from an absolute URL (e.g. a presigned image URL).
+    pub async fn fetch_url_bytes(&self, url: &str) -> Result<Vec<u8>> {
+        let resp = self.raw().get(url).send().await?;
         if !resp.status().is_success() {
             return Err(Error::Other(format!(
-                "download failed with status {}",
+                "fetch failed with status {}",
                 resp.status()
             )));
         }
@@ -229,6 +234,29 @@ impl SmartsClient {
             .and_then(Value::as_str)
             .map(str::to_string)
             .ok_or_else(|| Error::Other("no viewer_url in gateway response".into()))
+    }
+
+    /// Render a workspace file as a static image (`POST /v1/visualizations/render-view`).
+    /// Returns the raw gateway JSON: `thumbnail_base64`, `image_url`, `mime_type`, etc.
+    pub async fn render_view(
+        &self,
+        workspace_id: &str,
+        key: &str,
+        format: Option<&str>,
+        region: Option<&str>,
+        chart_type: Option<&str>,
+    ) -> Result<Value> {
+        let mut payload = json!({ "file_key": key, "workspace_id": workspace_id });
+        if let Some(f) = format {
+            payload["format"] = json!(f);
+        }
+        if let Some(r) = region {
+            payload["region"] = json!(r);
+        }
+        if let Some(c) = chart_type {
+            payload["chart_type"] = json!(c);
+        }
+        self.post_json("/v1/visualizations/render-view", payload).await
     }
 
     pub async fn create_folder(&self, workspace_id: &str, name: &str, path: &str) -> Result<Value> {
